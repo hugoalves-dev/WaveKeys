@@ -1,5 +1,7 @@
 // Copyright (c) Modding Forge
 
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 #[cfg(windows)]
 mod icon;
 #[cfg(windows)]
