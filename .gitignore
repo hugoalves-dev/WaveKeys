@@ -1,0 +1,26 @@
+# Rust build output
+/build/
+/dist/
+/target/
+**/*.rs.bk
+
+# Legacy .NET build output
+**/bin/
+**/obj/
+.vs/
+*.suo
+*.user
+
+# Local development files
+.env
+.env.local
+.idea/
+.vscode/
+*.code-workspace
+*.log
+*.pdb
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini

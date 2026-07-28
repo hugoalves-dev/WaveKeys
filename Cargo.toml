@@ -1,0 +1,17 @@
+# Copyright (c) Modding Forge
+
+[workspace]
+resolver = "2"
+members = ["src/core", "src/wavekeys"]
+default-members = ["src/wavekeys"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["Modding Forge"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
