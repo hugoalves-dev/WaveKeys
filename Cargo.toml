@@ -6,7 +6,7 @@ members = ["src/core", "src/wavekeys"]
 default-members = ["src/wavekeys"]
 
 [workspace.package]
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 license = "MIT"
 authors = ["Modding Forge"]

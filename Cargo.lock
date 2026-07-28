@@ -4429,7 +4429,7 @@ dependencies = [
 
 [[package]]
 name = "wavekeys"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "base64 0.22.1",
  "eframe",
@@ -4450,7 +4450,7 @@ dependencies = [
 
 [[package]]
 name = "wavekeys-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "futures-util",

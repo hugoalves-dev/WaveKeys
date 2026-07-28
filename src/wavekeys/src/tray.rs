@@ -7,7 +7,7 @@ use crate::{
 use eframe::egui;
 use std::{
     path::PathBuf,
-    sync::OnceLock,
+    sync::{mpsc, OnceLock},
     time::{Duration, Instant},
 };
 use tray_icon::{
@@ -171,9 +171,19 @@ fn pump_messages() {
 
 pub(crate) struct SettingsApp {
     config: Config,
+    saved_config: Config,
     autostart: bool,
+    saved_autostart: bool,
+    save_receiver: Option<mpsc::Receiver<SaveResult>>,
     accent: egui::Color32,
     close_requested: bool,
+}
+
+struct SaveResult {
+    config: Config,
+    config_saved: bool,
+    autostart: bool,
+    autostart_saved: bool,
 }
 
 impl SettingsApp {
@@ -191,8 +201,11 @@ impl SettingsApp {
             .status()
             .is_ok_and(|status| status.success());
         Self {
+            saved_config: config.clone(),
             config,
             autostart,
+            saved_autostart: autostart,
+            save_receiver: None,
             accent: windows_accent(),
             close_requested: false,
         }
@@ -206,25 +219,74 @@ impl SettingsApp {
         &self.config
     }
 
-    fn persist(&mut self) {
-        if let Err(error) = self.config.save() {
-            tracing::warn!(%error, "unable to save settings");
+    fn is_dirty(&self) -> bool {
+        self.config != self.saved_config || self.autostart != self.saved_autostart
+    }
+
+    fn poll_save(&mut self) {
+        let result = match self.save_receiver.as_ref().map(mpsc::Receiver::try_recv) {
+            Some(Ok(result)) => result,
+            Some(Err(mpsc::TryRecvError::Empty)) | None => return,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.save_receiver = None;
+                return;
+            }
+        };
+        self.save_receiver = None;
+        if result.config_saved {
+            self.saved_config = result.config;
         }
-        if let Err(error) =
-            configure_autostart(Some(if self.autostart { "enable" } else { "disable" }))
-        {
-            tracing::warn!(%error, "unable to update autostart");
+        if result.autostart_saved {
+            self.saved_autostart = result.autostart;
+        }
+    }
+
+    fn start_save(&mut self) {
+        if self.save_receiver.is_some() || !self.is_dirty() {
+            return;
+        }
+        let config = self.config.clone();
+        let save_config = config != self.saved_config;
+        let autostart = self.autostart;
+        let save_autostart = autostart != self.saved_autostart;
+        let (sender, receiver) = mpsc::channel();
+        match std::thread::Builder::new()
+            .name("wavekeys-settings-save".to_owned())
+            .spawn(move || {
+                let config_saved = !save_config
+                    || config
+                        .save()
+                        .map_err(|error| {
+                            tracing::warn!(%error, "unable to save settings");
+                        })
+                        .is_ok();
+                let autostart_saved = !save_autostart
+                    || configure_autostart(Some(if autostart { "enable" } else { "disable" }))
+                        .map_err(|error| {
+                            tracing::warn!(%error, "unable to update autostart");
+                        })
+                        .is_ok();
+                let _ = sender.send(SaveResult {
+                    config,
+                    config_saved,
+                    autostart,
+                    autostart_saved,
+                });
+            }) {
+            Ok(_) => self.save_receiver = Some(receiver),
+            Err(error) => tracing::warn!(%error, "unable to start settings save"),
         }
     }
 }
 
 impl SettingsApp {
     pub(crate) fn show(&mut self, ctx: &egui::Context) {
+        self.poll_save();
         egui_extras::install_image_loaders(ctx);
         ctx.set_visuals(egui::Visuals::dark());
         ctx.style_mut(|style| {
             style.visuals.selection.bg_fill = self.accent;
-            style.visuals.selection.stroke = egui::Stroke::new(1.5_f32, self.accent);
+            style.visuals.selection.stroke = egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
 
             style.visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgba_unmultiplied(
                 self.accent.r(),
@@ -318,13 +380,8 @@ impl SettingsApp {
                 settings_group(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.label("Step size");
-                    let step_changed =
-                        percent_slider(ui, &mut self.config.step_percent, 0.1..=100.0, 1.0)
-                            .on_hover_text("Volume change per key press")
-                            .changed();
-                    if step_changed {
-                        self.persist();
-                    }
+                    percent_slider(ui, &mut self.config.step_percent, 0.1..=100.0, 1.0)
+                        .on_hover_text("Volume change per key press");
                 });
                 ui.add_space(8.0);
                 settings_group(ui, |ui| {
@@ -340,39 +397,24 @@ impl SettingsApp {
                             .color(egui::Color32::WHITE),
                         )
                         .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_value(
-                                    &mut self.config.target_mix,
-                                    MixTarget::Monitor,
-                                    "Personal Mix",
-                                )
-                                .on_hover_text("Local Personal Mix")
-                                .changed()
-                            {
-                                self.persist();
-                            }
-                            if ui
-                                .selectable_value(
-                                    &mut self.config.target_mix,
-                                    MixTarget::Chat,
-                                    "Chat Mix",
-                                )
-                                .on_hover_text("Wave Link Chat Mix")
-                                .changed()
-                            {
-                                self.persist();
-                            }
-                            if ui
-                                .selectable_value(
-                                    &mut self.config.target_mix,
-                                    MixTarget::Stream,
-                                    "Stream Mix",
-                                )
-                                .on_hover_text("Wave Link Stream Mix")
-                                .changed()
-                            {
-                                self.persist();
-                            }
+                            ui.selectable_value(
+                                &mut self.config.target_mix,
+                                MixTarget::Monitor,
+                                "Personal Mix",
+                            )
+                            .on_hover_text("Local Personal Mix");
+                            ui.selectable_value(
+                                &mut self.config.target_mix,
+                                MixTarget::Chat,
+                                "Chat Mix",
+                            )
+                            .on_hover_text("Wave Link Chat Mix");
+                            ui.selectable_value(
+                                &mut self.config.target_mix,
+                                MixTarget::Stream,
+                                "Stream Mix",
+                            )
+                            .on_hover_text("Wave Link Stream Mix");
                         });
                     ui.add_space(5.0);
                     ui.label("Control scope");
@@ -386,93 +428,59 @@ impl SettingsApp {
                             .color(egui::Color32::WHITE),
                         )
                         .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_value(
-                                    &mut self.config.control_scope,
-                                    ControlScope::Focus,
-                                    "Focused app",
-                                )
-                                .on_hover_text(
-                                    "Control only the channel assigned to the focused app",
-                                )
-                                .changed()
-                            {
-                                self.persist();
-                            }
-                            if ui
-                                .selectable_value(
-                                    &mut self.config.control_scope,
-                                    ControlScope::Global,
-                                    "Global",
-                                )
-                                .on_hover_text(
-                                    "Control the entire selected mix, independent of focus",
-                                )
-                                .changed()
-                            {
-                                self.persist();
-                            }
+                            ui.selectable_value(
+                                &mut self.config.control_scope,
+                                ControlScope::Focus,
+                                "Focused app",
+                            )
+                            .on_hover_text("Control only the channel assigned to the focused app");
+                            ui.selectable_value(
+                                &mut self.config.control_scope,
+                                ControlScope::Global,
+                                "Global",
+                            )
+                            .on_hover_text("Control the entire selected mix, independent of focus");
                         });
                 });
                 ui.add_space(8.0);
                 settings_group(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.label("Volume overlay");
-                    let overlay_changed = accent_checkbox(
+                    accent_checkbox(
                         ui,
                         self.accent,
                         &mut self.config.overlay_enabled,
                         "Show volume overlay",
                     )
-                    .on_hover_text("Show the confirmed Wave Link level after a volume change")
-                    .changed();
-                    let name_changed = ui
-                        .add_enabled_ui(self.config.overlay_enabled, |ui| {
-                            accent_checkbox(
-                                ui,
-                                self.accent,
-                                &mut self.config.overlay_show_target_name,
-                                "Show channel or mix name",
-                            )
-                        })
-                        .inner
-                        .on_hover_text("Display the affected target above the level")
-                        .changed();
-                    let scale_changed = ui
-                        .add_enabled_ui(self.config.overlay_enabled, |ui| {
-                            ui.label("Scale");
-                            percent_slider(ui, &mut self.config.overlay_scale, 0.5..=2.0, 100.0)
-                        })
-                        .inner
-                        .on_hover_text("Resize the overlay from 50% to 200%")
-                        .changed();
-                    let icon_scale_changed = ui
-                        .add_enabled_ui(self.config.overlay_enabled, |ui| {
-                            ui.label("Icon size");
-                            percent_slider(
-                                ui,
-                                &mut self.config.overlay_icon_scale,
-                                0.5..=1.5,
-                                100.0,
-                            )
-                        })
-                        .inner
-                        .on_hover_text("Resize only the channel or mix icon")
-                        .changed();
-                    let font_scale_changed = ui
-                        .add_enabled_ui(self.config.overlay_enabled, |ui| {
-                            ui.label("Text size");
-                            percent_slider(
-                                ui,
-                                &mut self.config.overlay_font_scale,
-                                0.5..=1.5,
-                                100.0,
-                            )
-                        })
-                        .inner
-                        .on_hover_text("Resize the overlay name and percentage")
-                        .changed();
-                    let previous_font = self.config.overlay_font_family.clone();
+                    .on_hover_text("Show the confirmed Wave Link level after a volume change");
+                    ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
+                        accent_checkbox(
+                            ui,
+                            self.accent,
+                            &mut self.config.overlay_show_target_name,
+                            "Show channel or mix name",
+                        )
+                    })
+                    .inner
+                    .on_hover_text("Display the affected target above the level");
+                    ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
+                        ui.label("Scale");
+                        percent_slider(ui, &mut self.config.overlay_scale, 0.5..=2.0, 100.0)
+                    })
+                    .inner
+                    .on_hover_text("Resize the overlay from 50% to 200%");
+                    ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
+                        ui.label("Icon size");
+                        percent_slider(ui, &mut self.config.overlay_icon_scale, 0.5..=1.5, 100.0)
+                    })
+                    .inner
+                    .on_hover_text("Resize only the channel or mix icon");
+                    ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
+                        ui.label("Text size");
+                        percent_slider(ui, &mut self.config.overlay_font_scale, 0.5..=1.5, 100.0)
+                    })
+                    .inner
+                    .on_hover_text("Resize the overlay name and percentage");
                     ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
                         ui.label("Font");
                         egui::ComboBox::from_id_salt("overlay-font")
@@ -499,62 +507,58 @@ impl SettingsApp {
                                 }
                             });
                     });
-                    let font_changed = previous_font != self.config.overlay_font_family;
-                    let delay_changed = ui
-                        .add_enabled_ui(self.config.overlay_enabled, |ui| {
-                            ui.label("Hide delay");
-                            ui.add(
-                                egui::DragValue::new(&mut self.config.overlay_hide_delay_seconds)
-                                    .range(0.1..=10.0)
-                                    .speed(0.1)
-                                    .fixed_decimals(1)
-                                    .suffix(" s"),
-                            )
-                        })
-                        .inner
-                        .on_hover_text("Seconds after the last volume change; decimals are allowed")
-                        .changed();
-                    if overlay_changed
-                        || name_changed
-                        || scale_changed
-                        || icon_scale_changed
-                        || font_scale_changed
-                        || font_changed
-                        || delay_changed
-                    {
-                        self.persist();
-                    }
+                    ui.add_enabled_ui(self.config.overlay_enabled, |ui| {
+                        ui.label("Hide delay");
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.overlay_hide_delay_seconds)
+                                .range(0.1..=10.0)
+                                .speed(0.1)
+                                .fixed_decimals(1)
+                                .suffix(" s"),
+                        )
+                    })
+                    .inner
+                    .on_hover_text("Seconds after the last volume change; decimals are allowed");
                 });
                 ui.add_space(8.0);
-                let footer = ui.horizontal(|ui| {
-                    let changed =
+                let save_clicked = ui
+                    .horizontal(|ui| {
                         accent_checkbox(ui, self.accent, &mut self.autostart, "Start with Windows")
-                            .on_hover_text("Start automatically after signing in to Windows")
-                            .changed();
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if footer_link_button(
-                            ui,
-                            self.accent,
-                            egui::include_image!("../assets/github.svg"),
-                            "WaveKeys on GitHub",
-                            18.0,
-                        ) {
-                            open_url("https://github.com/Wuerfelhusten/WaveKeys");
-                        }
-                        if footer_link_button(
-                            ui,
-                            self.accent,
-                            egui::include_image!("../assets/kofi.svg"),
-                            "Ko-fi: wuerfelhusten",
-                            19.8,
-                        ) {
-                            open_url("https://ko-fi.com/wuerfelhusten");
-                        }
-                    });
-                    changed
-                });
-                if footer.inner {
-                    self.persist();
+                            .on_hover_text("Start automatically after signing in to Windows");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if footer_link_button(
+                                ui,
+                                self.accent,
+                                egui::include_image!("../assets/github.svg"),
+                                "WaveKeys on GitHub",
+                                18.0,
+                            ) {
+                                open_url("https://github.com/Wuerfelhusten/WaveKeys");
+                            }
+                            if footer_link_button(
+                                ui,
+                                self.accent,
+                                egui::include_image!("../assets/kofi.svg"),
+                                "Ko-fi: wuerfelhusten",
+                                19.8,
+                            ) {
+                                open_url("https://ko-fi.com/wuerfelhusten");
+                            }
+                            ui.add_space(6.0);
+                            let saving = self.save_receiver.is_some();
+                            ui.add_enabled(
+                                self.is_dirty() && !saving,
+                                egui::Button::new(if saving { "Saving..." } else { "Save" })
+                                    .min_size(egui::vec2(72.0, 28.0)),
+                            )
+                            .on_hover_text("Save settings")
+                            .clicked()
+                        })
+                        .inner
+                    })
+                    .inner;
+                if save_clicked {
+                    self.start_save();
                 }
             });
     }
