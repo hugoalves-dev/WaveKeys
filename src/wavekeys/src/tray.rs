@@ -177,6 +177,9 @@ pub(crate) struct SettingsApp {
     save_receiver: Option<mpsc::Receiver<SaveResult>>,
     accent: egui::Color32,
     close_requested: bool,
+    mixes: Vec<(String, String)>,
+    mix_receiver: Option<mpsc::Receiver<Result<Vec<(String, String)>, String>>>,
+    mix_error: Option<String>,
 }
 
 struct SaveResult {
@@ -200,7 +203,7 @@ impl SettingsApp {
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|status| status.success());
-        Self {
+        let mut app = Self {
             saved_config: config.clone(),
             config,
             autostart,
@@ -208,6 +211,78 @@ impl SettingsApp {
             save_receiver: None,
             accent: windows_accent(),
             close_requested: false,
+            mixes: Vec::new(),
+            mix_receiver: None,
+            mix_error: None,
+        };
+        app.refresh_mixes();
+        app
+    }
+
+    fn refresh_mixes(&mut self) {
+        if self.mix_receiver.is_some() {
+            return;
+        }
+        let config = self.config.clone();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                runtime.block_on(async {
+                    let endpoint = if config.endpoint == "auto" {
+                        wavekeys_core::wavelink::discover_endpoint()
+                            .await
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        config.endpoint
+                    };
+                    let mut client = wavekeys_core::wavelink::WaveLinkClient::connect(
+                        &endpoint,
+                        Duration::from_millis(config.rpc_timeout_ms),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    let response = client
+                        .call("getMixes", serde_json::Value::Null)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let mixes = response
+                        .get("mixes")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or("Missing mix list")?;
+                    Ok(mixes
+                        .iter()
+                        .filter_map(|mix| {
+                            Some((
+                                mix.get("id")?.as_str()?.to_owned(),
+                                mix.get("name")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("Mix")
+                                    .to_owned(),
+                            ))
+                        })
+                        .collect())
+                })
+            })();
+            let _ = sender.send(result);
+        });
+        self.mix_receiver = Some(receiver);
+        self.mix_error = None;
+    }
+
+    fn poll_mixes(&mut self) {
+        let result = match self.mix_receiver.as_ref().map(mpsc::Receiver::try_recv) {
+            Some(Ok(result)) => result,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => Err("Mix discovery stopped".into()),
+            _ => return,
+        };
+        self.mix_receiver = None;
+        match result {
+            Ok(mixes) => self.mixes = mixes,
+            Err(error) => self.mix_error = Some(error),
         }
     }
 
@@ -282,6 +357,7 @@ impl SettingsApp {
 impl SettingsApp {
     pub(crate) fn show(&mut self, ctx: &egui::Context) {
         self.poll_save();
+        self.poll_mixes();
         egui_extras::install_image_loaders(ctx);
         ctx.set_visuals(egui::Visuals::dark());
         ctx.style_mut(|style| {
@@ -416,6 +492,44 @@ impl SettingsApp {
                             )
                             .on_hover_text("Wave Link Stream Mix");
                         });
+                    if self.config.control_scope == ControlScope::Global {
+                        ui.add_space(5.0);
+                        ui.label("Global mixes (leave empty to use Target mix)");
+                        for (id, name) in &self.mixes {
+                            let mut selected = self.config.target_mix_ids.contains(id);
+                            if ui
+                                .checkbox(&mut selected, format!("{name} ({id})"))
+                                .changed()
+                            {
+                                if selected {
+                                    self.config.target_mix_ids.push(id.clone());
+                                } else {
+                                    self.config
+                                        .target_mix_ids
+                                        .retain(|selected_id| selected_id != id);
+                                }
+                            }
+                        }
+                        for id in self.config.target_mix_ids.clone() {
+                            if !self.mixes.iter().any(|mix| mix.0 == id) {
+                                if ui.button(format!("Remove unavailable mix: {id}")).clicked() {
+                                    self.config
+                                        .target_mix_ids
+                                        .retain(|selected_id| selected_id != &id);
+                                }
+                            }
+                        }
+                        if self.mix_receiver.is_some() {
+                            ui.label("Loading mixes...");
+                            ctx.request_repaint_after(Duration::from_millis(200));
+                        }
+                        if let Some(error) = &self.mix_error {
+                            ui.label(format!("Could not load mixes: {error}"));
+                        }
+                        if ui.button("Refresh mixes").clicked() {
+                            self.refresh_mixes();
+                        }
+                    }
                     ui.add_space(5.0);
                     ui.label("Control scope");
                     egui::ComboBox::from_id_salt("scope")

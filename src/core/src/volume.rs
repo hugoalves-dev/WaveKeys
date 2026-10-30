@@ -88,9 +88,14 @@ pub trait VolumeBackend: Send + Sync {
         &self,
         delta: f32,
         target: MixTarget,
+        mix_ids: &[String],
     ) -> Result<VolumeUpdate, VolumeError>;
     /// Toggles mute for the complete selected Wave Link mix.
-    async fn toggle_mute_global_mix(&self, target: MixTarget) -> Result<VolumeUpdate, VolumeError>;
+    async fn toggle_mute_global_mix(
+        &self,
+        target: MixTarget,
+        mix_ids: &[String],
+    ) -> Result<VolumeUpdate, VolumeError>;
     /// Produces a human-readable backend status.
     async fn status(&self) -> String;
 }
