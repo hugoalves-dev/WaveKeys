@@ -70,6 +70,7 @@ pub enum VolumeError {
 }
 
 /// Abstract implementation for focused-channel volume operations.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait VolumeBackend: Send + Sync {
     /// Returns whether an actionable focused channel currently exists.

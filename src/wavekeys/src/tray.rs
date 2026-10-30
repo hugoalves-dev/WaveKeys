@@ -169,6 +169,8 @@ fn pump_messages() {
     }
 }
 
+type MixDiscoveryResult = Result<Vec<(String, String)>, String>;
+
 pub(crate) struct SettingsApp {
     config: Config,
     saved_config: Config,
@@ -178,7 +180,7 @@ pub(crate) struct SettingsApp {
     accent: egui::Color32,
     close_requested: bool,
     mixes: Vec<(String, String)>,
-    mix_receiver: Option<mpsc::Receiver<Result<Vec<(String, String)>, String>>>,
+    mix_receiver: Option<mpsc::Receiver<MixDiscoveryResult>>,
     mix_error: Option<String>,
 }
 
@@ -511,12 +513,12 @@ impl SettingsApp {
                             }
                         }
                         for id in self.config.target_mix_ids.clone() {
-                            if !self.mixes.iter().any(|mix| mix.0 == id) {
-                                if ui.button(format!("Remove unavailable mix: {id}")).clicked() {
-                                    self.config
-                                        .target_mix_ids
-                                        .retain(|selected_id| selected_id != &id);
-                                }
+                            if !self.mixes.iter().any(|mix| mix.0 == id)
+                                && ui.button(format!("Remove unavailable mix: {id}")).clicked()
+                            {
+                                self.config
+                                    .target_mix_ids
+                                    .retain(|selected_id| selected_id != &id);
                             }
                         }
                         if self.mix_receiver.is_some() {
